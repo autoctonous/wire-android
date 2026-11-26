@@ -19,7 +19,7 @@ jobs:
           node-version: 20
       - name: Restore built APK cache
         id: apkcache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: wire-src.apk
           key: wire-src-apk-4.40.0-dev-v1
@@ -48,13 +48,19 @@ jobs:
           cp "$APK" wire-src.apk
       - name: APK info
         run: ls -l wire-src.apk
+      - name: Save built APK cache
+        if: steps.apkcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: wire-src.apk
+          key: wire-src-apk-4.40.0-dev-v1
       - name: Write login-screen test and spec
         run: |
           cat > login-test.mjs <<'JS'
           import fs from 'node:fs';
           const base = process.env.SPAWNDROID_WD_URL;
           const pkg = process.env.SPAWNDROID_APP_PACKAGE;
-          fs.mkdirSync('shots', { recursive: true });
+          fs.rmSync('shots', { recursive: true, force: true }); fs.mkdirSync('shots', { recursive: true });
           const call = async (method, path, body) => {
             const r = await fetch(base + path, { method, headers: { 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
             const j = await r.json().catch(() => ({}));
@@ -114,31 +120,35 @@ jobs:
             check('"No backend" option selectable', picked);
             await sleep(2500);
             src = await shot('after-no-backend');
-            const noBackend = picked;
-            // Back to the start screen if a picker is still showing
-            if (!(await find('Next'))) { await call('POST', `/session/${sid}/back`, {}).catch(() => {}); await sleep(2000); }
-            src = await shot('start-after-backend');
-
-            // Type an invalid value (not an email). Submit only when the server is switched off.
+            // The no-backend mode shows a configuration-link screen (no sign-in field)
+            check('configuration-link screen shown after "No backend"', !!(await find('Configuration link')) || !!(await find('Set Up')));
+            // Empty submit, then an invalid (non-URL) value
+            const setUp = await find('Set Up');
+            const enSet = setUp ? await call('GET', `/session/${sid}/element/${setUp}/enabled`) : null;
+            console.log('OBS: Set Up enabled with empty field =', enSet);
+            if (setUp && enSet) {
+              await call('POST', `/session/${sid}/element/${setUp}/click`, {});
+              console.log('TAP "Set Up" (empty field, no server configured)');
+              await sleep(2500);
+              src = await shot('set-up-empty');
+            }
             const fieldEls = await call('POST', `/session/${sid}/elements`, { using: 'xpath', value: '//android.widget.EditText' });
             check('input field found', fieldEls.length > 0);
             if (fieldEls.length) {
               const f = eid(fieldEls[0]);
-              await call('POST', `/session/${sid}/element/${f}/value`, { text: 'not-an-email' });
+              await call('POST', `/session/${sid}/element/${f}/value`, { text: 'not-a-link' });
               await sleep(1500);
               src = await shot('typed-invalid');
-              const nid = await find('Next');
-              const en = nid ? await call('GET', `/session/${sid}/element/${nid}/enabled`) : null;
-              console.log('OBS: Next enabled with invalid text =', en);
-              if (noBackend && nid && en) {
-                await call('POST', `/session/${sid}/element/${nid}/click`, {});
-                console.log('TAP "Next" (no-backend mode, invalid text)');
+              check('typed text visible in field', src.includes('not-a-link'));
+              const sid2 = await find('Set Up');
+              const en = sid2 ? await call('GET', `/session/${sid}/element/${sid2}/enabled`) : null;
+              console.log('OBS: Set Up enabled with invalid text =', en);
+              if (sid2 && en) {
+                await call('POST', `/session/${sid}/element/${sid2}/click`, {});
+                console.log('TAP "Set Up" (invalid text)');
                 await sleep(4000);
-                src = await shot('after-next-invalid');
-              } else {
-                console.log('SKIP tapping Next (disabled or server not switched off)');
+                src = await shot('set-up-invalid');
               }
-              // Rotation keeps typed text?
               await call('POST', `/session/${sid}/orientation`, { orientation: 'LANDSCAPE' });
               await sleep(2500);
               src = await shot('landscape');
@@ -146,15 +156,15 @@ jobs:
               await call('POST', `/session/${sid}/orientation`, { orientation: 'PORTRAIT' });
               await sleep(2500);
               src = await shot('portrait-again');
-              console.log('OBS: typed text still on screen after rotation =', src.includes('not-an-email'));
+              console.log('OBS: typed text still on screen after rotation =', src.includes('not-a-link'));
             }
             // Background and foreground
             await call('POST', `/session/${sid}/execute/sync`, { script: 'mobile: backgroundApp', args: [{ seconds: 4 }] });
             await sleep(2500);
             src = await shot('after-background');
             check('app back in foreground after background 4s', src.includes(pkg));
-            console.log('OBS: typed text still on screen after background =', src.includes('not-an-email'));
-            // Back key from the start screen
+            console.log('OBS: typed text still on screen after background =', src.includes('not-a-link'));
+            // Back key: from a root screen the app is expected to close
             await call('POST', `/session/${sid}/back`, {}).catch(() => {});
             await sleep(2500);
             src = await shot('after-back-key');
@@ -180,18 +190,23 @@ jobs:
           npx --yes spawndroid@0.1.8 check
           for i in 1 2; do
             time npx --yes spawndroid@0.1.8 run && exit 0
-            echo "attempt $i failed, retrying once"
-            sleep 10
+            echo "attempt $i failed, retrying once after 60s"
+            sleep 60
           done
           exit 1
       - name: Print small screenshots into the log
         if: always()
         run: |
-          for f in shots/*.png; do
-            [ -f "$f" ] || continue
-            convert "$f" -resize 300x -quality 45 /tmp/s.jpg
-            echo "SHOT $(basename "$f") $(base64 -w0 /tmp/s.jpg)"
-          done
+          pip install -q pillow
+          python3 - <<'PY'
+          import glob, base64, io, os
+          from PIL import Image
+          for f in sorted(glob.glob('shots/*.png')):
+              im = Image.open(f).convert('RGB')
+              im.thumbnail((300, 700))
+              b = io.BytesIO(); im.save(b, 'JPEG', quality=45)
+              print('SHOT', os.path.basename(f), base64.b64encode(b.getvalue()).decode())
+          PY
       - uses: actions/upload-artifact@v4
         if: always()
         with:
