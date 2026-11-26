@@ -1,0 +1,154 @@
+name: Benchmark Spawndroid vs GitHub-hosted emulator
+
+on:
+  push:
+    branches: [spawndroid-build]
+    paths: ['.github/workflows/bench.yml']
+  workflow_dispatch:
+
+jobs:
+  bench:
+    name: bench-${{ matrix.t }}-${{ matrix.n }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - {t: spawndroid, n: 1}
+          - {t: emulator, n: 1}
+          - {t: spawndroid, n: 2}
+          - {t: emulator, n: 2}
+          - {t: spawndroid, n: 3}
+          - {t: emulator, n: 3}
+          - {t: spawndroid, n: 4}
+          - {t: emulator, n: 4}
+          - {t: spawndroid, n: 5}
+          - {t: emulator, n: 5}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Restore built APK (same cached APK for both targets)
+        uses: actions/cache/restore@v4
+        with:
+          path: wire-src.apk
+          key: wire-src-apk-4.40.0-dev-v1
+          fail-on-cache-miss: true
+      - name: Prepare the same test script for both targets
+        run: |
+          python3 - <<'PY'
+          import re, textwrap
+          s = open('.github/workflows/spawndroid-build.yml').read()
+          m = re.search(r"cat > login-test.mjs <<'JS'\n(.*?)\n\s*JS\n", s, re.S)
+          body = textwrap.dedent(m.group(1))
+          body = body.replace("const results = [];", "const results = [];\nconsole.log('T_START', Date.now());", 1)
+          body = body.replace("let src = await shot('launch');", "let src = await shot('launch');\n  console.log('T_FIRST', Date.now());", 1)
+          body = body.replace("const failed = results.filter", "console.log('T_END', Date.now());\nconst failed = results.filter", 1)
+          open('login-test.mjs', 'w').write(body + "\n")
+          PY
+          grep -c "T_START\|T_FIRST\|T_END" login-test.mjs
+          cat > spawndroid.yaml <<'YAML'
+          version: 1
+          app: wire-src.apk
+          command: [node, login-test.mjs]
+          profile: android-14-phone
+          timeout: 900
+          YAML
+          BT=$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)
+          "$ANDROID_HOME/build-tools/$BT/aapt2" dump packagename wire-src.apk | tee /tmp/pkg.txt
+          mkdir -p shots
+      - name: Spawndroid run
+        if: matrix.t == 'spawndroid'
+        env:
+          SPAWNDROID_API_KEY: ${{ secrets.SPAWNDROID_API_KEY }}
+        run: |
+          date +%s.%N > /tmp/b_start.txt
+          npx --yes spawndroid@0.1.8 check
+          date +%s.%N > /tmp/b_check_end.txt
+          set +e
+          npx --yes spawndroid@0.1.8 run 2>&1 | tee /tmp/test.log
+          rc=${PIPESTATUS[0]}
+          date +%s.%N > /tmp/b_end.txt
+          echo $rc > /tmp/b_rc.txt
+          exit $rc
+      - name: Enable KVM
+        if: matrix.t == 'emulator'
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Install Appium
+        if: matrix.t == 'emulator'
+        run: |
+          date +%s.%N > /tmp/b_start.txt
+          npm install -g appium
+          appium driver install uiautomator2
+          date +%s.%N > /tmp/b_appium_end.txt
+      - name: Write emulator script
+        if: matrix.t == 'emulator'
+        run: |
+          cat > bench-emu.sh <<'SH'
+          date +%s.%N > /tmp/b_booted.txt
+          PKG=$(cat /tmp/pkg.txt)
+          "$ANDROID_HOME/platform-tools/adb" install -r wire-src.apk
+          appium --log-level error > /tmp/appium.log 2>&1 &
+          for i in $(seq 1 60); do curl -s http://127.0.0.1:4723/status | grep -q ready && break; sleep 1; done
+          export SPAWNDROID_WD_URL=http://127.0.0.1:4723
+          export SPAWNDROID_APP_PACKAGE="$PKG"
+          set +e
+          node login-test.mjs 2>&1 | tee /tmp/test.log
+          rc=${PIPESTATUS[0]}
+          date +%s.%N > /tmp/b_end.txt
+          echo $rc > /tmp/b_rc.txt
+          exit $rc
+          SH
+          date +%s.%N > /tmp/b_emu_step_start.txt
+      - name: Run on GitHub-hosted emulator
+        if: matrix.t == 'emulator'
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          script: bash bench-emu.sh
+      - name: Benchmark summary line
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import os, re
+          def rd(p):
+              try: return open(p).read().strip()
+              except Exception: return None
+          def f(p):
+              v = rd(p)
+              return float(v) if v else None
+          t = os.environ.get('T', '')
+          log = rd('/tmp/test.log') or ''
+          def ms(k):
+              m = re.search(k + r' (\d+)', log)
+              return int(m.group(1)) / 1000 if m else None
+          ts, tf, te = ms('T_START'), ms('T_FIRST'), ms('T_END')
+          start, end, rc = f('/tmp/b_start.txt'), f('/tmp/b_end.txt'), rd('/tmp/b_rc.txt')
+          sm = re.search(r'SUMMARY: (\S+)', log)
+          def d(a, b): return '%.1f' % (a - b) if a is not None and b is not None else 'n/a'
+          name = os.environ.get('NAME')
+          if os.environ.get('T') == 'spawndroid':
+              extra = 'check=%s' % d(f('/tmp/b_check_end.txt'), start)
+              boot = d(ts, start)
+          else:
+              extra = 'appium_setup=%s emu_boot=%s adb_install_appium_start=%s' % (d(f('/tmp/b_appium_end.txt'), start), d(f('/tmp/b_booted.txt'), f('/tmp/b_emu_step_start.txt')), d(ts, f('/tmp/b_booted.txt')))
+              boot = d(ts, start)
+          line = 'BENCH %s | rc=%s | checks=%s | tooling_start_to_test_start=%s | launch_to_first_screen=%s | test_total=%s | tooling_start_to_done=%s | %s' % (name, rc, sm.group(1) if sm else 'none', boot, d(tf, ts), d(te, ts), d(end, start), extra)
+          print(line)
+          open(os.environ['GITHUB_STEP_SUMMARY'], 'a').write('- ' + line + '\n')
+          PY
+        env:
+          T: ${{ matrix.t }}
+          NAME: ${{ matrix.t }}-${{ matrix.n }}
