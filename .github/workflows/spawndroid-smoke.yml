@@ -1,0 +1,57 @@
+name: Spawndroid smoke test (Wire prod APK)
+
+on:
+  workflow_dispatch:
+  pull_request:
+
+jobs:
+  spawndroid:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Download the released Wire APK
+        run: |
+          curl -fL -o wire.apk "https://github.com/wireapp/wire-android/releases/download/v4.39.0/com.wire.android-v4.39.0-56291-prod-compatrelease.apk"
+          ls -l wire.apk
+      - name: Write smoke test and spec
+        run: |
+          cat > smoke.mjs <<'JS'
+          const base = process.env.SPAWNDROID_WD_URL;
+          const pkg = process.env.SPAWNDROID_APP_PACKAGE || 'com.wire.android';
+          const call = async (method, path, body) => {
+            const r = await fetch(base + path, { method, headers: { 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+            const j = await r.json().catch(() => ({}));
+            if (!r.ok) throw new Error(method + ' ' + path + ' -> ' + r.status + ' ' + JSON.stringify(j));
+            return j.value;
+          };
+          const s = await call('POST', '/session', { capabilities: { alwaysMatch: { platformName: 'Android', 'appium:automationName': 'UiAutomator2', 'appium:noReset': true } } });
+          const sid = s.sessionId;
+          try {
+            await call('POST', `/session/${sid}/execute/sync`, { script: 'mobile: activateApp', args: [{ appId: pkg }] });
+            await new Promise((r) => setTimeout(r, 8000));
+            const src = await call('GET', `/session/${sid}/source`);
+            console.log('page source bytes:', src.length);
+            if (!src.includes(pkg)) throw new Error('Wire (' + pkg + ') is not in the foreground');
+            const png = await call('GET', `/session/${sid}/screenshot`);
+            console.log('screenshot base64 bytes:', png.length);
+            console.log('PASS: Wire launched on Spawndroid');
+          } finally {
+            await call('DELETE', `/session/${sid}`).catch(() => {});
+          }
+          JS
+          cat > spawndroid.yaml <<'YAML'
+          version: 1
+          app: wire.apk
+          command: [node, smoke.mjs]
+          profile: android-14-phone
+          timeout: 600
+          YAML
+      - name: Run on Spawndroid
+        env:
+          SPAWNDROID_API_KEY: ${{ secrets.SPAWNDROID_API_KEY }}
+        run: |
+          npx --yes spawndroid@0.1.8 check
+          npx --yes spawndroid@0.1.8 run
