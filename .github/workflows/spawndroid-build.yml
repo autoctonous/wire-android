@@ -188,12 +188,13 @@ jobs:
           SPAWNDROID_API_KEY: ${{ secrets.SPAWNDROID_API_KEY }}
         run: |
           npx --yes spawndroid@0.1.8 check
-          for i in 1 2; do
-            time npx --yes spawndroid@0.1.8 run && exit 0
-            echo "attempt $i failed, retrying once after 60s"
-            sleep 60
+          fail=0
+          for i in 1 2 3 4; do
+            s=$(date +%s)
+            if npx --yes spawndroid@0.1.8 run; then r=PASS; else r=FAIL; fail=1; fi
+            echo "RUNRESULT $i: $r in $(( $(date +%s) - s ))s"
           done
-          exit 1
+          exit $fail
       - name: Print small screenshots into the log
         if: always()
         run: |
