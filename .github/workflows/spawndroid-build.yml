@@ -1,4 +1,4 @@
-name: Spawndroid build and tap test (Wire from source)
+name: Spawndroid build and login-screen test (from source)
 
 on:
   workflow_dispatch:
@@ -14,40 +14,47 @@ jobs:
         with:
           submodules: recursive
           fetch-depth: 1
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: 21
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+      - name: Restore built APK cache
+        id: apkcache
+        uses: actions/cache@v4
+        with:
+          path: wire-src.apk
+          key: wire-src-apk-4.40.0-dev-v1
+      - uses: actions/setup-java@v4
+        if: steps.apkcache.outputs.cache-hit != 'true'
+        with:
+          distribution: temurin
+          java-version: 21
       - name: Free disk space
+        if: steps.apkcache.outputs.cache-hit != 'true'
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android/sdk/ndk 2>/dev/null || true
           df -h /
       - name: Accept Android licenses
+        if: steps.apkcache.outputs.cache-hit != 'true'
         run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
       - name: Build from source (Gradle)
+        if: steps.apkcache.outputs.cache-hit != 'true'
         run: |
           date +%s > build_start.txt
-          cp -n local.properties kalium/local.properties 2>/dev/null || true
           echo "sdk.dir=$ANDROID_HOME" > local.properties
           echo "sdk.dir=$ANDROID_HOME" > kalium/local.properties
           ./gradlew assembleDevDebug --no-daemon --stacktrace -Dorg.gradle.jvmargs="-Xmx6g -XX:MaxMetaspaceSize=1g"
           echo "build seconds: $(( $(date +%s) - $(cat build_start.txt) ))"
-      - name: Pick the APK
-        run: |
-          find . -name '*.apk' -path '*build/outputs*' -exec ls -l {} \;
-          APK=$(find . -name '*.apk' -path '*build/outputs*' | grep -i arm64 | head -1)
-          [ -z "$APK" ] && APK=$(find . -name '*.apk' -path '*build/outputs*' | head -1)
-          echo "using $APK"
+          APK=$(find . -name '*.apk' -path '*build/outputs*' | head -1)
           cp "$APK" wire-src.apk
-          ls -l wire-src.apk
-      - name: Write tap test and spec
+      - name: APK info
+        run: ls -l wire-src.apk
+      - name: Write login-screen test and spec
         run: |
-          cat > taps.mjs <<'JS'
+          cat > login-test.mjs <<'JS'
+          import fs from 'node:fs';
           const base = process.env.SPAWNDROID_WD_URL;
           const pkg = process.env.SPAWNDROID_APP_PACKAGE;
+          fs.mkdirSync('shots', { recursive: true });
           const call = async (method, path, body) => {
             const r = await fetch(base + path, { method, headers: { 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
             const j = await r.json().catch(() => ({}));
@@ -55,59 +62,114 @@ jobs:
             return j.value;
           };
           const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+          const results = [];
+          const check = (name, ok, detail = '') => { results.push({ name, ok }); console.log(`CHECK ${ok ? 'PASS' : 'FAIL'}: ${name} ${detail}`); };
           const s = await call('POST', '/session', { capabilities: { alwaysMatch: { platformName: 'Android', 'appium:automationName': 'UiAutomator2', 'appium:noReset': true } } });
           const sid = s.sessionId;
-          const labels = (src) => [...src.matchAll(/(?:text|content-desc)="([^"]+)"/g)].map((m) => m[1]).filter((t) => t.trim());
-          const dump = async (name) => {
+          const W3C = 'element-6066-11e4-a52e-4f735466cecf';
+          const eid = (e) => e[W3C] || e.ELEMENT;
+          const labels = (src) => [...src.matchAll(/(?:text|content-desc|hint)="([^"]+)"/g)].map((m) => m[1]).filter((t) => t.trim());
+          let n = 0;
+          const shot = async (name) => {
+            n++;
+            const b64 = await call('GET', `/session/${sid}/screenshot`);
+            const f = `shots/${String(n).padStart(2, '0')}-${name}.png`;
+            fs.writeFileSync(f, Buffer.from(b64, 'base64'));
             const src = await call('GET', `/session/${sid}/source`);
-            console.log(`--- screen: ${name} (${src.length} bytes) ---`);
-            console.log(labels(src).join(' | '));
-            await call('GET', `/session/${sid}/screenshot`);
+            console.log(`SCREEN ${f}: ${labels(src).join(' | ')}`);
             return src;
           };
-          const clickables = async () => {
-            const els = await call('POST', `/session/${sid}/elements`, { using: 'xpath', value: '//*[@clickable="true"]' });
-            const out = [];
-            for (const e of els) {
-              const id = e['element-6066-11e4-a52e-4f735466cecf'] || e.ELEMENT;
-              const text = await call('GET', `/session/${sid}/element/${id}/text`).catch(() => '');
-              const desc = await call('GET', `/session/${sid}/element/${id}/attribute/content-desc`).catch(() => '');
-              out.push({ id, label: (text || desc || '').trim() });
-            }
-            return out;
+          const find = async (label) => {
+            const x = `//*[@text="${label}" or @content-desc="${label}" or @hint="${label}"]`;
+            const els = await call('POST', `/session/${sid}/elements`, { using: 'xpath', value: x });
+            return els.length ? eid(els[0]) : null;
           };
-          let taps = 0;
+          const tapLabel = async (label) => {
+            const id = await find(label);
+            if (!id) return false;
+            await call('POST', `/session/${sid}/element/${id}/click`, {});
+            console.log(`TAP "${label}"`);
+            return true;
+          };
+          const fg = async () => (await call('GET', `/session/${sid}/source`)).includes(pkg);
           try {
             await call('POST', `/session/${sid}/execute/sync`, { script: 'mobile: activateApp', args: [{ appId: pkg }] });
             await sleep(12000);
-            const first = await dump('launch');
-            if (!first.includes(pkg)) throw new Error('app not in foreground: ' + pkg);
-            for (let round = 0; round < 3; round++) {
-              const items = (await clickables()).filter((c) => c.label);
-              console.log('clickables:', JSON.stringify(items.map((c) => c.label)));
-              const target = items.find((c) => /log ?in|sign ?in|create|continue|next|enterprise|personal/i.test(c.label)) || items[0];
-              if (!target) { console.log('nothing to tap'); break; }
-              const before = await call('GET', `/session/${sid}/source`);
-              console.log(`TAP #${round + 1}: "${target.label}"`);
-              await call('POST', `/session/${sid}/element/${target.id}/click`, {});
-              taps++;
-              await sleep(4000);
-              const after = await dump(`after tap ${round + 1}`);
-              console.log('screen changed:', before !== after);
-              await call('POST', `/session/${sid}/back`, {}).catch(() => {});
-              await sleep(2000);
-              await dump(`after back ${round + 1}`);
+            let src = await shot('launch');
+            check('app in foreground after launch', src.includes(pkg));
+            check('start screen shows Next button', !!(await find('Next')));
+            check('start screen shows email/SSO field', !!(await find('EMAIL OR SSO CODE')) || !!(await find('enter your email or sso code')));
+
+            // Next state with empty field
+            const nextId = await find('Next');
+            const enabledEmpty = nextId ? await call('GET', `/session/${sid}/element/${nextId}/enabled`) : null;
+            console.log('OBS: Next enabled with empty field =', enabledEmpty);
+            await shot('empty-field');
+
+            // Switch to the no-server option so nothing typed can reach a real server
+            check('backend picker opens by label', await tapLabel('Change application backend'));
+            await sleep(2500);
+            src = await shot('backend-picker');
+            const picked = await tapLabel('No backend');
+            check('"No backend" option selectable', picked);
+            await sleep(2500);
+            src = await shot('after-no-backend');
+            const noBackend = picked;
+            // Back to the start screen if a picker is still showing
+            if (!(await find('Next'))) { await call('POST', `/session/${sid}/back`, {}).catch(() => {}); await sleep(2000); }
+            src = await shot('start-after-backend');
+
+            // Type an invalid value (not an email). Submit only when the server is switched off.
+            const fieldEls = await call('POST', `/session/${sid}/elements`, { using: 'xpath', value: '//android.widget.EditText' });
+            check('input field found', fieldEls.length > 0);
+            if (fieldEls.length) {
+              const f = eid(fieldEls[0]);
+              await call('POST', `/session/${sid}/element/${f}/value`, { text: 'not-an-email' });
+              await sleep(1500);
+              src = await shot('typed-invalid');
+              const nid = await find('Next');
+              const en = nid ? await call('GET', `/session/${sid}/element/${nid}/enabled`) : null;
+              console.log('OBS: Next enabled with invalid text =', en);
+              if (noBackend && nid && en) {
+                await call('POST', `/session/${sid}/element/${nid}/click`, {});
+                console.log('TAP "Next" (no-backend mode, invalid text)');
+                await sleep(4000);
+                src = await shot('after-next-invalid');
+              } else {
+                console.log('SKIP tapping Next (disabled or server not switched off)');
+              }
+              // Rotation keeps typed text?
+              await call('POST', `/session/${sid}/orientation`, { orientation: 'LANDSCAPE' });
+              await sleep(2500);
+              src = await shot('landscape');
+              check('app alive after rotation', src.includes(pkg));
+              await call('POST', `/session/${sid}/orientation`, { orientation: 'PORTRAIT' });
+              await sleep(2500);
+              src = await shot('portrait-again');
+              console.log('OBS: typed text still on screen after rotation =', src.includes('not-an-email'));
             }
-            if (taps < 1) throw new Error('no taps performed');
-            console.log(`PASS: launched source-built app and performed ${taps} taps`);
+            // Background and foreground
+            await call('POST', `/session/${sid}/execute/sync`, { script: 'mobile: backgroundApp', args: [{ seconds: 4 }] });
+            await sleep(2500);
+            src = await shot('after-background');
+            check('app back in foreground after background 4s', src.includes(pkg));
+            console.log('OBS: typed text still on screen after background =', src.includes('not-an-email'));
+            // Back key from the start screen
+            await call('POST', `/session/${sid}/back`, {}).catch(() => {});
+            await sleep(2500);
+            src = await shot('after-back-key');
+            console.log('OBS: app still foreground after Back key =', src.includes(pkg));
           } finally {
             await call('DELETE', `/session/${sid}`).catch(() => {});
           }
+          const failed = results.filter((r) => !r.ok);
+          console.log(`SUMMARY: ${results.length - failed.length}/${results.length} checks passed`);
+          if (failed.length) process.exit(1);
           JS
           cat > spawndroid.yaml <<'YAML'
           version: 1
           app: wire-src.apk
-          command: [node, taps.mjs]
+          command: [node, login-test.mjs]
           profile: android-14-phone
           timeout: 900
           YAML
@@ -116,4 +178,22 @@ jobs:
           SPAWNDROID_API_KEY: ${{ secrets.SPAWNDROID_API_KEY }}
         run: |
           npx --yes spawndroid@0.1.8 check
-          time npx --yes spawndroid@0.1.8 run
+          for i in 1 2; do
+            time npx --yes spawndroid@0.1.8 run && exit 0
+            echo "attempt $i failed, retrying once"
+            sleep 10
+          done
+          exit 1
+      - name: Print small screenshots into the log
+        if: always()
+        run: |
+          for f in shots/*.png; do
+            [ -f "$f" ] || continue
+            convert "$f" -resize 300x -quality 45 /tmp/s.jpg
+            echo "SHOT $(basename "$f") $(base64 -w0 /tmp/s.jpg)"
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: login-test-screenshots
+          path: shots/
