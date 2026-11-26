@@ -1,0 +1,119 @@
+name: Spawndroid build and tap test (Wire from source)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [spawndroid-build]
+
+jobs:
+  build-and-run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android/sdk/ndk 2>/dev/null || true
+          df -h /
+      - name: Accept Android licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+      - name: Build from source (Gradle)
+        run: |
+          date +%s > build_start.txt
+          cp -n local.properties kalium/local.properties 2>/dev/null || true
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          echo "sdk.dir=$ANDROID_HOME" > kalium/local.properties
+          ./gradlew assembleDevDebug --no-daemon --stacktrace -Dorg.gradle.jvmargs="-Xmx6g -XX:MaxMetaspaceSize=1g"
+          echo "build seconds: $(( $(date +%s) - $(cat build_start.txt) ))"
+      - name: Pick the APK
+        run: |
+          find . -name '*.apk' -path '*build/outputs*' -exec ls -l {} \;
+          APK=$(find . -name '*.apk' -path '*build/outputs*' | grep -i arm64 | head -1)
+          [ -z "$APK" ] && APK=$(find . -name '*.apk' -path '*build/outputs*' | head -1)
+          echo "using $APK"
+          cp "$APK" wire-src.apk
+          ls -l wire-src.apk
+      - name: Write tap test and spec
+        run: |
+          cat > taps.mjs <<'JS'
+          const base = process.env.SPAWNDROID_WD_URL;
+          const pkg = process.env.SPAWNDROID_APP_PACKAGE;
+          const call = async (method, path, body) => {
+            const r = await fetch(base + path, { method, headers: { 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+            const j = await r.json().catch(() => ({}));
+            if (!r.ok) throw new Error(method + ' ' + path + ' -> ' + r.status + ' ' + JSON.stringify(j));
+            return j.value;
+          };
+          const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+          const s = await call('POST', '/session', { capabilities: { alwaysMatch: { platformName: 'Android', 'appium:automationName': 'UiAutomator2', 'appium:noReset': true } } });
+          const sid = s.sessionId;
+          const labels = (src) => [...src.matchAll(/(?:text|content-desc)="([^"]+)"/g)].map((m) => m[1]).filter((t) => t.trim());
+          const dump = async (name) => {
+            const src = await call('GET', `/session/${sid}/source`);
+            console.log(`--- screen: ${name} (${src.length} bytes) ---`);
+            console.log(labels(src).join(' | '));
+            await call('GET', `/session/${sid}/screenshot`);
+            return src;
+          };
+          const clickables = async () => {
+            const els = await call('POST', `/session/${sid}/elements`, { using: 'xpath', value: '//*[@clickable="true"]' });
+            const out = [];
+            for (const e of els) {
+              const id = e['element-6066-11e4-a52e-4f735466cecf'] || e.ELEMENT;
+              const text = await call('GET', `/session/${sid}/element/${id}/text`).catch(() => '');
+              const desc = await call('GET', `/session/${sid}/element/${id}/attribute/content-desc`).catch(() => '');
+              out.push({ id, label: (text || desc || '').trim() });
+            }
+            return out;
+          };
+          let taps = 0;
+          try {
+            await call('POST', `/session/${sid}/execute/sync`, { script: 'mobile: activateApp', args: [{ appId: pkg }] });
+            await sleep(12000);
+            const first = await dump('launch');
+            if (!first.includes(pkg)) throw new Error('app not in foreground: ' + pkg);
+            for (let round = 0; round < 3; round++) {
+              const items = (await clickables()).filter((c) => c.label);
+              console.log('clickables:', JSON.stringify(items.map((c) => c.label)));
+              const target = items.find((c) => /log ?in|sign ?in|create|continue|next|enterprise|personal/i.test(c.label)) || items[0];
+              if (!target) { console.log('nothing to tap'); break; }
+              const before = await call('GET', `/session/${sid}/source`);
+              console.log(`TAP #${round + 1}: "${target.label}"`);
+              await call('POST', `/session/${sid}/element/${target.id}/click`, {});
+              taps++;
+              await sleep(4000);
+              const after = await dump(`after tap ${round + 1}`);
+              console.log('screen changed:', before !== after);
+              await call('POST', `/session/${sid}/back`, {}).catch(() => {});
+              await sleep(2000);
+              await dump(`after back ${round + 1}`);
+            }
+            if (taps < 1) throw new Error('no taps performed');
+            console.log(`PASS: launched source-built app and performed ${taps} taps`);
+          } finally {
+            await call('DELETE', `/session/${sid}`).catch(() => {});
+          }
+          JS
+          cat > spawndroid.yaml <<'YAML'
+          version: 1
+          app: wire-src.apk
+          command: [node, taps.mjs]
+          profile: android-14-phone
+          timeout: 900
+          YAML
+      - name: Run on Spawndroid
+        env:
+          SPAWNDROID_API_KEY: ${{ secrets.SPAWNDROID_API_KEY }}
+        run: |
+          npx --yes spawndroid@0.1.8 check
+          time npx --yes spawndroid@0.1.8 run
